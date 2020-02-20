@@ -24,6 +24,7 @@
 #include <srt/srt.h>
 
 #include "libavutil/avassert.h"
+#include "libavutil/collectd.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/time.h"
@@ -90,6 +91,20 @@ typedef struct SRTContext {
     int messageapi;
     SRT_TRANSTYPE transtype;
     int linger;
+
+    char *hostname;
+
+    // Measurements via collectd
+    char *collectd_address;
+    int collectd_interval;
+    char *collectd_identifier_host;
+    char *collectd_identifier_plugin;
+    char *collectd_identifier_plugin_instance;
+    int collectd_debug;
+
+    AVCollectdClient* collectd_client;
+    lcc_identifier_t collectd_identifier;
+    int64_t collectd_measurements_collected_at;
 } SRTContext;
 
 #define D AV_OPT_FLAG_DECODING_PARAM
@@ -140,8 +155,22 @@ static const AVOption libsrt_options[] = {
     { "live",           NULL, 0, AV_OPT_TYPE_CONST,  { .i64 = SRTT_LIVE }, INT_MIN, INT_MAX, .flags = D|E, "transtype" },
     { "file",           NULL, 0, AV_OPT_TYPE_CONST,  { .i64 = SRTT_FILE }, INT_MIN, INT_MAX, .flags = D|E, "transtype" },
     { "linger",         "Number of seconds that the socket waits for unsent data when closing", OFFSET(linger),           AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
+
+    { "collectd_address", "collectd server address or path to socket",                          OFFSET(collectd_address),                       AV_OPT_TYPE_STRING,      { .str = NULL }, .flags = D|E },
+    { "collectd_identifier_host", "collectd identifier host",                                   OFFSET(collectd_identifier_host),               AV_OPT_TYPE_STRING,      { .str = NULL }, .flags = D|E },
+    { "collectd_identifier_plugin", "collectd identifier plugin",                               OFFSET(collectd_identifier_plugin),             AV_OPT_TYPE_STRING,      { .str = "ffmpeg" }, .flags = D|E },
+    { "collectd_identifier_plugin_instance", "collectd identifier plugin instance",             OFFSET(collectd_identifier_plugin_instance),    AV_OPT_TYPE_STRING,      { .str = "srt" }, .flags = D|E },
+    { "collectd_interval", "collectd measurements interval (seconds)",                          OFFSET(collectd_interval),                      AV_OPT_TYPE_INT,         { .i64 = 5 }, 1, INT_MAX, .flags = D|E },
+    { "collectd_debug", "log data sent to collectd",                                            OFFSET(collectd_debug),                         AV_OPT_TYPE_INT,         { .i64 = 0 }, 0, 1, .flags = D|E },
     { NULL }
 };
+
+typedef struct SRTStat {
+    const char *name;
+    int offset;
+    enum AVOptionType type;
+    const char *collectd_type;
+} SRTStat;
 
 static int libsrt_neterrno(URLContext *h)
 {
@@ -501,6 +530,17 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
     return ret;
 }
 
+static void libsrt_gethostname(SRTContext *s) {
+    size_t host_len = 1024;
+
+    s->hostname = av_malloc(host_len);
+    if (!s->hostname) {
+        return;
+    }
+
+    gethostname(s->hostname, host_len);
+}
+
 static int libsrt_open(URLContext *h, const char *uri, int flags)
 {
     SRTContext *s = h->priv_data;
@@ -510,6 +550,16 @@ static int libsrt_open(URLContext *h, const char *uri, int flags)
 
     if (srt_startup() < 0) {
         return AVERROR_UNKNOWN;
+    }
+
+    if (s->collectd_address) {
+        libsrt_gethostname(s);
+
+        s->collectd_client = av_collectd_client_alloc(s, s->collectd_address);
+
+        snprintf(s->collectd_identifier.host, sizeof(s->collectd_identifier.host), "%s", s->collectd_identifier_host ? s->collectd_identifier_host : s->hostname);
+        snprintf(s->collectd_identifier.plugin, sizeof(s->collectd_identifier.plugin), "%s", s->collectd_identifier_plugin);
+        snprintf(s->collectd_identifier.plugin_instance, sizeof(s->collectd_identifier.plugin_instance), "%s", s->collectd_identifier_plugin_instance);
     }
 
     /* SRT options (srt/srt.h) */
@@ -642,10 +692,194 @@ err:
     return ret;
 }
 
+static int libsrt_collectd_interval_elapsed(SRTContext *s) {
+    if (s->collectd_measurements_collected_at == 0) {
+        s->collectd_measurements_collected_at = av_gettime_relative();
+        return 0;
+    }
+
+    int64_t now = av_gettime_relative();
+    int64_t diff = (now - s->collectd_measurements_collected_at) * 1.0e-6;
+
+    return diff > s->collectd_interval;
+}
+
+#define SRT_STATS_OFFSET(x) offsetof(SRT_TRACEBSTATS, x)
+
+static const SRTStat libsrt_caller_interval_measurements[] = {
+    { "pktSent",            SRT_STATS_OFFSET(pktSent),              AV_OPT_TYPE_INT64,  "packets" },
+    { "pktSndLoss",         SRT_STATS_OFFSET(pktSndLoss),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktRetrans",         SRT_STATS_OFFSET(pktRetrans),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktSentACK",         SRT_STATS_OFFSET(pktSentACK),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktSentNAK",         SRT_STATS_OFFSET(pktSentNAK),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktSndFilterExtra",  SRT_STATS_OFFSET(pktSndFilterExtra),    AV_OPT_TYPE_INT,    "packets" },
+    { "mbpsSendRate",       SRT_STATS_OFFSET(mbpsSendRate),         AV_OPT_TYPE_DOUBLE, "bitrate" },
+    { "usSndDuration",      SRT_STATS_OFFSET(usSndDuration),        AV_OPT_TYPE_INT64,  "counter" },
+    { "pktSndDrop",         SRT_STATS_OFFSET(pktSndDrop),           AV_OPT_TYPE_INT,    "packets" },
+    { "byteSent",           SRT_STATS_OFFSET(byteSent),             AV_OPT_TYPE_UINT64, "bytes" },
+    { "byteRetrans",        SRT_STATS_OFFSET(byteRetrans),          AV_OPT_TYPE_UINT64, "bytes" },
+    { "byteSndDrop",        SRT_STATS_OFFSET(byteSndDrop),          AV_OPT_TYPE_UINT64, "bytes" },
+    { NULL }
+};
+
+static const SRTStat libsrt_caller_instantaneous_measurements[] = {
+    { "usPktSndPeriod",         SRT_STATS_OFFSET(usPktSndPeriod),       AV_OPT_TYPE_DOUBLE, "counter" },
+    { "pktFlowWindow",          SRT_STATS_OFFSET(pktFlowWindow),        AV_OPT_TYPE_INT,    "packets" },
+    { "pktCongestionWindow",    SRT_STATS_OFFSET(pktCongestionWindow),  AV_OPT_TYPE_INT,    "packets" },
+    { "pktFlightSize",          SRT_STATS_OFFSET(pktFlightSize),        AV_OPT_TYPE_INT,    "packets" },
+    { "msRTT",                  SRT_STATS_OFFSET(msRTT),                AV_OPT_TYPE_DOUBLE, "total_time_in_ms" },
+    { "mbpsBandwidth",          SRT_STATS_OFFSET(mbpsBandwidth),        AV_OPT_TYPE_DOUBLE, "bitrate" },
+    { "byteAvailSndBuf",        SRT_STATS_OFFSET(byteAvailSndBuf),      AV_OPT_TYPE_INT,    "bytes" },
+    { "pktSndBuf",              SRT_STATS_OFFSET(pktSndBuf),            AV_OPT_TYPE_INT,    "packets" },
+    { "byteSndBuf",             SRT_STATS_OFFSET(byteSndBuf),           AV_OPT_TYPE_INT,    "bytes" },
+    { "msSndBuf",               SRT_STATS_OFFSET(msSndBuf),             AV_OPT_TYPE_INT,    "total_time_in_ms" },
+    { NULL }
+};
+
+static const SRTStat libsrt_listener_interval_measurements[] = {
+    { "pktRecv",                SRT_STATS_OFFSET(pktRecv),              AV_OPT_TYPE_INT64,  "packets" },
+    { "pktRcvLoss",             SRT_STATS_OFFSET(pktRcvLoss),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktRecvACK",             SRT_STATS_OFFSET(pktRecvACK),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktRecvNAK",             SRT_STATS_OFFSET(pktRecvNAK),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktRcvFilterExtra",      SRT_STATS_OFFSET(pktRcvFilterExtra),    AV_OPT_TYPE_INT,    "packets" },
+    { "pktRcvFilterSupply",     SRT_STATS_OFFSET(pktRcvFilterSupply),   AV_OPT_TYPE_INT,    "packets" },
+    { "pktRcvFilterLoss",       SRT_STATS_OFFSET(pktRcvFilterLoss),     AV_OPT_TYPE_INT,    "packets" },
+    { "mbpsRecvRate",           SRT_STATS_OFFSET(mbpsRecvRate),         AV_OPT_TYPE_DOUBLE, "bitrate" },
+    { "pktReorderDistance",     SRT_STATS_OFFSET(pktReorderDistance),   AV_OPT_TYPE_INT,    "packets" },
+    { "pktReorderTolerance",    SRT_STATS_OFFSET(pktReorderTolerance),  AV_OPT_TYPE_INT,    "packets" },
+    { "pktRcvAvgBelatedTime",   SRT_STATS_OFFSET(pktRcvAvgBelatedTime), AV_OPT_TYPE_DOUBLE,  "count" },
+    { "pktRcvBelated",          SRT_STATS_OFFSET(pktRcvBelated),        AV_OPT_TYPE_INT64,  "packets" },
+    { "pktRcvDrop",             SRT_STATS_OFFSET(pktRcvDrop),           AV_OPT_TYPE_INT,    "packets" },
+    { "pktRcvUndecrypt",        SRT_STATS_OFFSET(pktRcvUndecrypt),      AV_OPT_TYPE_INT,    "packets" },
+    { "byteRecv",               SRT_STATS_OFFSET(byteRecv),             AV_OPT_TYPE_UINT64, "bytes" },
+#ifdef SRT_ENABLE_LOSTBYTESCOUNT
+    { "byteRcvLoss",            SRT_STATS_OFFSET(byteRcvLoss),          AV_OPT_TYPE_UINT64, "bytes" },
+#endif
+    { "byteRcvDrop",            SRT_STATS_OFFSET(byteRcvDrop),          AV_OPT_TYPE_UINT64, "bytes" },
+    { "byteRcvUndecrypt",       SRT_STATS_OFFSET(byteRcvUndecrypt),     AV_OPT_TYPE_UINT64, "bytes" },
+    { NULL }
+};
+
+static const SRTStat libsrt_listener_instantaneous_measurements[] = {
+    { "msRTT",              SRT_STATS_OFFSET(msRTT),            AV_OPT_TYPE_DOUBLE, "total_time_in_ms" },
+    { "byteAvailRcvBuf",    SRT_STATS_OFFSET(byteAvailRcvBuf),  AV_OPT_TYPE_INT,    "bytes" },
+    { "pktRcvBuf",          SRT_STATS_OFFSET(pktRcvBuf),        AV_OPT_TYPE_INT,    "bytes" },
+    { "byteRcvBuf",         SRT_STATS_OFFSET(byteRcvBuf),       AV_OPT_TYPE_INT,    "bytes" },
+    { "msRcvBuf",           SRT_STATS_OFFSET(msRcvBuf),         AV_OPT_TYPE_INT,    "total_time_in_ms" },
+    { "msRcvTsbPdDelay",    SRT_STATS_OFFSET(msRcvTsbPdDelay),  AV_OPT_TYPE_INT,    "total_time_in_ms" },
+    { NULL }
+};
+
+static void libsrt_collectd_send_measurements(SRTContext *s, SRT_TRACEBSTATS *stats, const SRTStat *stat) {
+    // Initialise value list
+    lcc_value_list_t vals;
+    vals.values_len = 1;
+    vals.time = 0;
+    vals.interval = s->collectd_interval;
+    vals.identifier = s->collectd_identifier;
+
+    // Initialise a single value type
+    int values_types[1];
+    vals.values_types = values_types;
+
+    // Initialise a single value
+    value_t values[1];
+    vals.values = values;
+
+    while (stat->name) {
+        // Pointer to the value in stats struct
+        uint8_t *val_ptr = ((uint8_t *)stats) + stat->offset;
+
+        switch (stat->type)
+        {
+        case AV_OPT_TYPE_UINT64: {
+            uint64_t* val = (uint64_t*) val_ptr;
+            values_types[0] = LCC_TYPE_ABSOLUTE;
+            values[0].absolute = *val;
+            break;
+        }
+        case AV_OPT_TYPE_INT64: {
+            int64_t *val = (int64_t *)val_ptr;
+            values_types[0] = LCC_TYPE_ABSOLUTE;
+            values[0].absolute = (uint64_t) *val;
+            break;
+        }
+        case AV_OPT_TYPE_INT: {
+            int *val = (int *)val_ptr;
+            values_types[0] = LCC_TYPE_ABSOLUTE;
+            values[0].absolute = (uint64_t) *val;
+            break;
+        }
+        case AV_OPT_TYPE_DOUBLE: {
+            double *val = (double *)val_ptr;
+            values_types[0] = LCC_TYPE_GAUGE;
+            values[0].gauge = *val;
+            break;
+        }
+        }
+
+        // Send stat to collectd
+        snprintf(vals.identifier.type, sizeof(vals.identifier.type), "%s", stat->collectd_type);
+        snprintf(vals.identifier.type_instance, sizeof(vals.identifier.type_instance), "%s", stat->name);
+        av_collectd_putval(s->collectd_client, vals);
+
+        if (s->collectd_debug) {
+            av_collectd_print_value_list(s->collectd_client, vals);
+        }
+
+        stat++;
+    }
+}
+
+/*
+ * Collect all measurements from libsrt and send them to collectd
+ * if the collection interval has elapsed.
+ */
+static void libsrt_collectd_measurements(SRTContext *s) {
+    if (!s->collectd_client) {
+        return;
+    }
+
+    if (!libsrt_collectd_interval_elapsed(s)) {
+        return;
+    }
+
+    SRT_TRACEBSTATS stats = { 0 };
+    s->collectd_measurements_collected_at = av_gettime_relative();
+
+    // Interval measurements
+    int ret = srt_bstats(s->fd, &stats, 1);
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "failed to get interval measurements from libsrt\n");
+        return;
+    }
+
+    if (s->mode == SRT_MODE_LISTENER) {
+        libsrt_collectd_send_measurements(s, &stats, &libsrt_listener_interval_measurements[0]);
+    } else if (s->mode == SRT_MODE_CALLER) {
+        libsrt_collectd_send_measurements(s, &stats, &libsrt_caller_interval_measurements[0]);
+    }
+
+    // Instantaneous measurements
+    ret = srt_bistats(s->fd, &stats, 1, 1);
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "failed to get instantaneous measurements from libsrt\n");
+        return;
+    }
+
+    if (s->mode == SRT_MODE_LISTENER) {
+        libsrt_collectd_send_measurements(s, &stats, &libsrt_listener_instantaneous_measurements[0]);
+    } else if (s->mode == SRT_MODE_CALLER) {
+        libsrt_collectd_send_measurements(s, &stats, &libsrt_caller_instantaneous_measurements[0]);
+    }
+}
+
 static int libsrt_read(URLContext *h, uint8_t *buf, int size)
 {
     SRTContext *s = h->priv_data;
     int ret;
+
+    libsrt_collectd_measurements(s);
 
     if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
         ret = libsrt_network_wait_fd_timeout(h, s->eid, s->fd, 0, h->rw_timeout, &h->interrupt_callback);
@@ -665,6 +899,8 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
 {
     SRTContext *s = h->priv_data;
     int ret;
+
+    libsrt_collectd_measurements(s);
 
     if (!(h->flags & AVIO_FLAG_NONBLOCK)) {
         ret = libsrt_network_wait_fd_timeout(h, s->eid, s->fd, 1, h->rw_timeout, &h->interrupt_callback);
@@ -689,6 +925,12 @@ static int libsrt_close(URLContext *h)
     srt_epoll_release(s->eid);
 
     srt_cleanup();
+
+    if (s->collectd_client) {
+        av_collectd_client_free(&s->collectd_client);
+    }
+
+    av_freep(&s->hostname);
 
     return 0;
 }

@@ -17,6 +17,7 @@ HEADERS = adler32.h                                                     \
           cast5.h                                                       \
           camellia.h                                                    \
           channel_layout.h                                              \
+          collectd.h                                                    \
           common.h                                                      \
           cpu.h                                                         \
           crc.h                                                         \
@@ -105,6 +106,7 @@ OBJS = adler32.o                                                        \
        cast5.o                                                          \
        camellia.o                                                       \
        channel_layout.o                                                 \
+       collectd.o                                                       \
        color_utils.o                                                    \
        cpu.o                                                            \
        crc.o                                                            \
